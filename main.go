@@ -70,26 +70,44 @@ func main() {
 		panic(err)
 	}
 
-	// 4. "Big Bang": Genesis Allocation (MUST happen before P2P starts)
-	genesisSeed := make([]byte, 32)
-	copy(genesisSeed, []byte("supernova-genesis-seed-key-12345"))
-	genesisPriv := ed25519.NewKeyFromSeed(genesisSeed)
-	genesisPub := genesisPriv.Public().(ed25519.PublicKey)
+	// 4. "Big Bang": Genesis Allocation (Multi-Validator)
+	// Validator 1: Singapore (Dev Key)
+	genSeed1 := make([]byte, 32)
+	copy(genSeed1, []byte("supernova-genesis-seed-key-12345"))
+	genPub1 := ed25519.NewKeyFromSeed(genSeed1).Public().(ed25519.PublicKey)
+	var genID1 [32]byte
+	copy(genID1[:], genPub1)
 
-	var genesisID [32]byte
-	copy(genesisID[:], genesisPub)
+	// Validator 2: Mumbai
+	genSeed2, _ := hex.DecodeString("3456dd1fde79a7e4da4c22897cff695db252aba429ea715b68a2b8e6aaf78fdb")
+	genPub2 := ed25519.NewKeyFromSeed(genSeed2).Public().(ed25519.PublicKey)
+	var genID2 [32]byte
+	copy(genID2[:], genPub2)
 
-	// Reduced to fit uint64: 10 Billion * 1 Million
-	balance := uint64(10_000_000_000 * 1_000_000)
-	stake := uint64(5_000_000 * 1_000_000)
+	// Validator 3: USA
+	genSeed3, _ := hex.DecodeString("acc7c020b65d1d18f63b1e8cbabec25f1a755006759ced445c06c4c8bbb9be32")
+	genPub3 := ed25519.NewKeyFromSeed(genSeed3).Public().(ed25519.PublicKey)
+	var genID3 [32]byte
+	copy(genID3[:], genPub3)
 
-	state.SetBalance(genesisID, balance)
-	state.SetStake(genesisID, stake) // 5 Million NVN Staked
+	// Reduced to fit uint64: 10 Billion Total, Split 3 ways
+	balance := uint64(3_333_333_333 * 1_000_000)
+	stake := uint64(1_666_666_666 * 1_000_000)
 
-	fmt.Printf("💥 Big Bang! Genesis Validator: %x\n", genesisID[:4])
-	fmt.Printf("💰 Allocation: %d NVN (Stake: %d)\n",
-		state.GetBalance(genesisID)/1_000_000,
-		state.GetStake(genesisID)/1_000_000)
+	// Allocate to all 3
+	state.SetBalance(genID1, balance)
+	state.SetStake(genID1, stake)
+
+	state.SetBalance(genID2, balance)
+	state.SetStake(genID2, stake)
+
+	state.SetBalance(genID3, balance)
+	state.SetStake(genID3, stake)
+
+	fmt.Printf("💥 Big Bang! Genesis Validators via DPoS:\n")
+	fmt.Printf("1. Singapore: %x\n", genID1[:4])
+	fmt.Printf("2. Mumbai:    %x\n", genID2[:4])
+	fmt.Printf("3. USA:       %x\n", genID3[:4])
 
 	// 5. Initialize P2P Network
 	p2pServer := p2p.NewServer(*p2pPort, *maxPeers, dag, state, executor)
