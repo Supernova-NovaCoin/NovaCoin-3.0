@@ -227,10 +227,9 @@ func handleTransaction(isSend, isStake bool, toStr string, amountVal uint64, key
 
 	// Construct Tx
 	tx := types.Transaction{
-		Author:    [32]byte(pub),
-		Timestamp: time.Now().UnixNano(),
-		Amount:    amountVal * 1_000_000, // Convert to nanoNVN
-		Nonce:     time.Now().UnixNano(),
+		From:   [32]byte(pub),
+		Amount: amountVal * 1_000_000, // Convert to nanoNVN
+		Nonce:  uint64(time.Now().UnixNano()),
 	}
 
 	if isSend {
@@ -249,7 +248,7 @@ func handleTransaction(isSend, isStake bool, toStr string, amountVal uint64, key
 	// Sign
 	msg := tx.SerializeForSigning()
 	sig := ed25519.Sign(priv, msg)
-	copy(tx.Signature[:], sig)
+	tx.Sig = sig
 
 	// Send to UDP
 	var buf bytes.Buffer
