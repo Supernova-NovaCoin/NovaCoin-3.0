@@ -29,7 +29,21 @@ func main() {
 	maxPeers := flag.Int("maxpeers", 100, "Maximum number of connected peers")
 	genKey := flag.Bool("genkey", false, "Generate a new Validator KeyPair")
 	minerKey := flag.String("minerkey", "", "Hex-encoded Seed for Mining (32 bytes)")
+
+	// CLI Commands
+	send := flag.Bool("send", false, "Send NVN")
+	stake := flag.Bool("stake", false, "Stake NVN")
+	to := flag.String("to", "", "Recipient Address (Hex) for -send")
+	amount := flag.Uint64("amount", 0, "Amount in NVN")
+	key := flag.String("key", "", "Sender/Staker Private Seed (Hex)")
+
 	flag.Parse()
+
+	// Handle Transaction Commands
+	if *send || *stake {
+		handleTransaction(*send, *stake, *to, *amount, *key, *udpPort)
+		return
+	}
 
 	if *genKey {
 		seed := make([]byte, 32)
