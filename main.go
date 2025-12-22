@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/gob"
 	"encoding/hex"
 	"flag"
 	"fmt"
+	"net"
 
 	"os"
 	"os/signal"
@@ -16,6 +19,7 @@ import (
 	"novacoin/core/pulse"
 	"novacoin/core/store"
 	"novacoin/core/tpu"
+	"novacoin/core/types"
 
 	"strings"
 	"time"
@@ -32,7 +36,7 @@ func main() {
 
 	// CLI Commands
 	send := flag.Bool("send", false, "Send NVN")
-	stake := flag.Bool("stake", false, "Stake NVN")
+	stakeFlag := flag.Bool("stake", false, "Stake NVN")
 	to := flag.String("to", "", "Recipient Address (Hex) for -send")
 	amount := flag.Uint64("amount", 0, "Amount in NVN")
 	key := flag.String("key", "", "Sender/Staker Private Seed (Hex)")
@@ -40,8 +44,8 @@ func main() {
 	flag.Parse()
 
 	// Handle Transaction Commands
-	if *send || *stake {
-		handleTransaction(*send, *stake, *to, *amount, *key, *udpPort)
+	if *send || *stakeFlag {
+		handleTransaction(*send, *stakeFlag, *to, *amount, *key, *udpPort)
 		return
 	}
 
@@ -199,4 +203,71 @@ func main() {
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	<-c
 	fmt.Println("\n🛑 Stopping Supernova...")
+}
+
+func handleTransaction(isSend, isStake bool, toStr string, amountVal uint64, keyStr string, udpPort int) {
+	if keyStr == "" {
+		keyStr = "73757065726e6f76612d67656e657369732d736565642d6b65792d3132333435"
+	}
+
+	var seed []byte
+	var err error
+	if keyStr == "genesis" {
+		seed = make([]byte, 32)
+		copy(seed, []byte("supernova-genesis-seed-key-12345"))
+	} else {
+		seed, err = hex.DecodeString(keyStr)
+		if err != nil {
+			panic("Invalid key hex")
+		}
+	}
+
+	priv := ed25519.NewKeyFromSeed(seed)
+	pub := priv.Public().(ed25519.PublicKey)
+
+	// Construct Tx
+	tx := types.Transaction{
+		Author:    [32]byte(pub),
+		Timestamp: time.Now().UnixNano(),
+		Amount:    amountVal * 1_000_000, // Convert to nanoNVN
+		Nonce:     time.Now().UnixNano(),
+	}
+
+	if isSend {
+		tx.Type = types.TxTransfer
+		if toStr == "" {
+			panic("-to address required for send")
+		}
+		toBytes, _ := hex.DecodeString(toStr)
+		copy(tx.To[:], toBytes)
+		fmt.Printf("💸 Sending %d NVN to %s...\n", amountVal, toStr)
+	} else if isStake {
+		tx.Type = types.TxStake
+		fmt.Printf("🔒 Staking %d NVN for %x...\n", amountVal, pub[:4])
+	}
+
+	// Sign
+	msg := tx.SerializeForSigning()
+	sig := ed25519.Sign(priv, msg)
+	copy(tx.Signature[:], sig)
+
+	// Send to UDP
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	if err := enc.Encode(tx); err != nil {
+		panic(err)
+	}
+
+	conn, err := net.Dial("udp", fmt.Sprintf("127.0.0.1:%d", udpPort))
+	if err != nil {
+		panic(err)
+	}
+	defer conn.Close()
+
+	_, err = conn.Write(buf.Bytes())
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Println("✅ Transaction Sent to Ingest Engine!")
 }
