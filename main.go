@@ -103,6 +103,8 @@ func main() {
 	copy(genID2[:], genPub2)
 
 	// Validator 3: USA
+	// Validator 3: USA
+	genSeed3, _ := hex.DecodeString("acc7c020b65d1d18f63b1e8cbabec25f1a755006759ced445c06c4c8bbb9be32")
 	genPub3 := ed25519.NewKeyFromSeed(genSeed3).Public().(ed25519.PublicKey)
 	var genID3 [32]byte
 	copy(genID3[:], genPub3)
