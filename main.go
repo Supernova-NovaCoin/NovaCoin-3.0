@@ -164,6 +164,9 @@ func main() {
 		}
 	}()
 
+	// 6. Start API Server (Background)
+	go startExplorerAPI(dag, state)
+
 	// Connect to peers
 	if *peers != "" {
 		peerList := strings.Split(*peers, ",")

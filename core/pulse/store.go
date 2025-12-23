@@ -15,12 +15,17 @@ type VertexStore struct {
 	Vertices map[Hash]*Vertex
 	Tips     map[Hash]bool
 	mu       sync.RWMutex
+
+	// Explorer Support
+	Recent      []Hash        // Circular buffer of recent hashes
+	OnNewVertex func(*Vertex) // Callback for real-time events
 }
 
 func NewVertexStore() *VertexStore {
 	vs := &VertexStore{
 		Vertices: make(map[Hash]*Vertex),
 		Tips:     make(map[Hash]bool),
+		Recent:   make([]Hash, 0, 50),
 	}
 	vs.LoadTips()
 	return vs
@@ -29,13 +34,31 @@ func NewVertexStore() *VertexStore {
 // AddVertex inserts a new vertex into the DAG and persists it.
 func (vs *VertexStore) AddVertex(v *Vertex) {
 	vs.mu.Lock()
-	defer vs.mu.Unlock()
 
 	// 1. Update In-Memory Cache
+	if _, exists := vs.Vertices[v.Hash]; exists {
+		vs.mu.Unlock()
+		return
+	}
+
 	vs.Vertices[v.Hash] = v
 	vs.Tips[v.Hash] = true
 	for _, parentHash := range v.Parents {
 		delete(vs.Tips, parentHash)
+	}
+
+	// Update Recent List (Keep last 50)
+	vs.Recent = append([]Hash{v.Hash}, vs.Recent...)
+	if len(vs.Recent) > 50 {
+		vs.Recent = vs.Recent[:50]
+	}
+
+	callback := vs.OnNewVertex
+	vs.mu.Unlock()
+
+	// Notify Listener (Non-blocking ideally, but here sync is fine for prototype)
+	if callback != nil {
+		go callback(v)
 	}
 
 	// 2. Persist to Disk
@@ -133,4 +156,18 @@ func (vs *VertexStore) GetAllVertices() []*Vertex {
 		all = append(all, v)
 	}
 	return all
+}
+
+// GetRecentVertices returns the last N blocks added.
+func (vs *VertexStore) GetRecentVertices() []*Vertex {
+	vs.mu.RLock()
+	defer vs.mu.RUnlock()
+
+	var recent []*Vertex
+	for _, hash := range vs.Recent {
+		if v, ok := vs.Vertices[hash]; ok {
+			recent = append(recent, v)
+		}
+	}
+	return recent
 }
