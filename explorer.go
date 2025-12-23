@@ -63,6 +63,12 @@ func startExplorerAPI(dag *pulse.VertexStore, state *execution.StateManager) {
 
 	mux := http.NewServeMux()
 
+	// 0. Root Handler (Health Check)
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.Write([]byte("Supernova Explorer API Active 🚀\nEndpoints: /api/stats, /api/blocks, /ws"))
+	})
+
 	// 1. WebSocket Endpoint
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		ws, err := upgrader.Upgrade(w, r, nil)
