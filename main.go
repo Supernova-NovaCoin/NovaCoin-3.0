@@ -103,10 +103,21 @@ func main() {
 	copy(genID2[:], genPub2)
 
 	// Validator 3: USA
-	genSeed3, _ := hex.DecodeString("acc7c020b65d1d18f63b1e8cbabec25f1a755006759ced445c06c4c8bbb9be32")
 	genPub3 := ed25519.NewKeyFromSeed(genSeed3).Public().(ed25519.PublicKey)
 	var genID3 [32]byte
 	copy(genID3[:], genPub3)
+
+	// User Miner 1: Germany
+	gemPubHex := "809677ea09986593d3dedbeb3b6f5d1fe66855ef4a3ea28a9ba64c05cdad7076"
+	gemPubBytes, _ := hex.DecodeString(gemPubHex)
+	var genID4 [32]byte
+	copy(genID4[:], gemPubBytes)
+
+	// User Miner 2: UK
+	ukPubHex := "0810a0748d15669e791a23828b013e775223ab124672fb39a6d07be5a66e258b"
+	ukPubBytes, _ := hex.DecodeString(ukPubHex)
+	var genID5 [32]byte
+	copy(genID5[:], ukPubBytes)
 
 	// Reduced to fit uint64: 10 Billion Total, Split 3 ways
 	balance := uint64(3_333_333_333 * 1_000_000)
@@ -122,10 +133,22 @@ func main() {
 	state.SetBalance(genID3, balance)
 	state.SetStake(genID3, stake)
 
+	// Give Germany & UK instant stake (5M each)
+	userBalance := uint64(10_000_000 * 1_000_000)
+	userStake := uint64(5_000_000 * 1_000_000)
+
+	state.SetBalance(genID4, userBalance)
+	state.SetStake(genID4, userStake)
+
+	state.SetBalance(genID5, userBalance)
+	state.SetStake(genID5, userStake)
+
 	fmt.Printf("💥 Big Bang! Genesis Validators via DPoS:\n")
 	fmt.Printf("1. Singapore: %x\n", genID1[:4])
 	fmt.Printf("2. Mumbai:    %x\n", genID2[:4])
 	fmt.Printf("3. USA:       %x\n", genID3[:4])
+	fmt.Printf("4. Germany:   %x\n", genID4[:4])
+	fmt.Printf("5. UK:        %x\n", genID5[:4])
 
 	// 5. Initialize P2P Network
 	p2pServer := p2p.NewServer(*p2pPort, *maxPeers, dag, state, executor)
