@@ -76,7 +76,12 @@ func (vs *VertexStore) AddVertex(v *Vertex) {
 			}
 
 			// Save Tips
-			return vs.saveTipsTxn(txn)
+			if err := vs.saveTipsTxn(txn); err != nil {
+				return err
+			}
+
+			// Save Recent (New)
+			return vs.saveRecentTxn(txn)
 		})
 		if err != nil {
 			log.Printf("Failed to persist vertex: %v", err)
@@ -96,32 +101,55 @@ func (vs *VertexStore) saveTipsTxn(txn *badger.Txn) error {
 	return txn.Set([]byte("meta:tips"), buf.Bytes())
 }
 
+func (vs *VertexStore) saveRecentTxn(txn *badger.Txn) error {
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(vs.Recent); err != nil {
+		return err
+	}
+	return txn.Set([]byte("meta:recent"), buf.Bytes())
+}
+
 func (vs *VertexStore) LoadTips() {
 	if store.DB == nil {
 		return
 	}
 
 	err := store.DB.View(func(txn *badger.Txn) error {
+		// Load Tips
 		item, err := txn.Get([]byte("meta:tips"))
-		if err != nil {
-			return err
+		if err == nil {
+			item.Value(func(val []byte) error {
+				var tips []Hash
+				if err := gob.NewDecoder(bytes.NewReader(val)).Decode(&tips); err != nil {
+					return err
+				}
+				vs.mu.Lock()
+				for _, t := range tips {
+					vs.Tips[t] = true
+				}
+				vs.mu.Unlock()
+				return nil
+			})
 		}
 
-		return item.Value(func(val []byte) error {
-			var tips []Hash
-			if err := gob.NewDecoder(bytes.NewReader(val)).Decode(&tips); err != nil {
-				return err
-			}
-			vs.mu.Lock()
-			for _, t := range tips {
-				vs.Tips[t] = true
-			}
-			vs.mu.Unlock()
-			return nil
-		})
+		// Load Recent
+		item, err = txn.Get([]byte("meta:recent"))
+		if err == nil {
+			item.Value(func(val []byte) error {
+				var recent []Hash
+				if err := gob.NewDecoder(bytes.NewReader(val)).Decode(&recent); err != nil {
+					return err
+				}
+				vs.mu.Lock()
+				vs.Recent = recent
+				vs.mu.Unlock()
+				return nil
+			})
+		}
+		return nil
 	})
 	if err != nil && err != badger.ErrKeyNotFound {
-		log.Printf("Failed to load tips: %v", err)
+		log.Printf("Failed to load metadata: %v", err)
 	}
 }
 
