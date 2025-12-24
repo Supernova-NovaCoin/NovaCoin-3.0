@@ -11,6 +11,7 @@ import (
 type Peer struct {
 	Conn     net.Conn
 	Outbound bool      // True if we initiated the connection
+	NodeID   string    // Unique ID (Pubkey Hex)
 	Stats    PeerStats // Verification: Metrics
 	Encoder  *gob.Encoder
 	Decoder  *gob.Decoder

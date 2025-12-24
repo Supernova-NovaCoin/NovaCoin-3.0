@@ -8,6 +8,8 @@ import (
 	"novacoin/core/execution"
 	"novacoin/core/pulse"
 	"novacoin/core/staking"
+	"novacoin/core/tpu"
+	"novacoin/core/types"
 	"sync"
 )
 
@@ -21,25 +23,29 @@ type Server struct {
 	Transport  *Transport
 	Peers      map[string]*Peer
 	KnownPeers map[string]bool // Set of known peer addresses
+	NodeID     string          // Unique ID of this node (Public Key Hex)
 
 	DAG      *pulse.VertexStore      // Link to the DAG
 	State    *execution.StateManager // Link to State for staking check
 	Executor *execution.Executor     // Link to Executor for rewards
+	Mempool  *tpu.Mempool            // Link to Mempool for Tx storage
+
 	// Security / DDoS Protection
 	ConnCount map[string]int // Count of connections per IP
 	MaxPeers  int            // Total max peers
 	MaxPerIP  int            // Max peers per IP
 
-	lock sync.RWMutex
-	Quit chan struct{}
+	PeersMutex sync.RWMutex
+	Quit       chan struct{}
 }
 
 // NewServer creates a new P2P server instance.
-func NewServer(addr string, maxPeers int, dag *pulse.VertexStore, state *execution.StateManager, exec *execution.Executor) *Server {
+func NewServer(addr string, maxPeers int, nodeID string, dag *pulse.VertexStore, state *execution.StateManager, exec *execution.Executor, mempool *tpu.Mempool) *Server {
 	return &Server{
 		Transport:  NewTransport(addr),
 		Peers:      make(map[string]*Peer),
 		KnownPeers: make(map[string]bool),
+		NodeID:     nodeID,
 		ConnCount:  make(map[string]int),
 		MaxPeers:   maxPeers,
 		MaxPerIP:   5, // Strict per-IP Limit (Hardcoded for now)
@@ -47,6 +53,7 @@ func NewServer(addr string, maxPeers int, dag *pulse.VertexStore, state *executi
 		DAG:      dag,
 		State:    state,
 		Executor: exec,
+		Mempool:  mempool,
 		Quit:     make(chan struct{}),
 	}
 }
@@ -77,9 +84,9 @@ func (s *Server) acceptLoop() {
 			}
 
 			// DDoS Check 1: Max Total Peers
-			s.lock.RLock()
+			s.PeersMutex.RLock()
 			total := len(s.Peers)
-			s.lock.RUnlock()
+			s.PeersMutex.RUnlock()
 			if total >= s.MaxPeers {
 				log.Printf("⚠️ DDoS Protection: Dropped conn from %s (Max Peers Reached)", conn.RemoteAddr())
 				conn.Close()
@@ -88,16 +95,16 @@ func (s *Server) acceptLoop() {
 
 			// DDoS Check 2: Max Per IP
 			ip, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
-			s.lock.Lock()
+			s.PeersMutex.Lock()
 			count := s.ConnCount[ip]
 			if count >= s.MaxPerIP {
-				s.lock.Unlock()
+				s.PeersMutex.Unlock()
 				log.Printf("⚠️ DDoS Protection: Dropped conn from %s (Rate Limit Exceeded)", ip)
 				conn.Close()
 				continue
 			}
 			s.ConnCount[ip]++
-			s.lock.Unlock()
+			s.PeersMutex.Unlock()
 
 			go s.handleConn(conn, false)
 		}
@@ -121,7 +128,7 @@ func (s *Server) handleConn(conn net.Conn, outbound bool) {
 	// 1. Send Handshake
 	hsData := HandshakeData{
 		Version:     ProtocolVersion,
-		NodeID:      "node-1", // TODO: proper ID
+		NodeID:      s.NodeID,
 		GenesisHash: GenesisHash,
 		Height:      0, // TODO: get from DAG
 	}
@@ -168,6 +175,7 @@ func (s *Server) handleConn(conn net.Conn, outbound bool) {
 
 	log.Printf("Handshake success with %s (Ver: %d)", conn.RemoteAddr(), remoteHS.Version)
 
+	peer.NodeID = remoteHS.NodeID
 	s.AddPeer(peer)
 
 	// Start read loop
@@ -195,8 +203,19 @@ func (s *Server) readLoop(p *Peer) {
 func (s *Server) handleMessage(p *Peer, msg Message) {
 	switch msg.Type {
 	case MsgTx:
-		// TODO: Forward to TPU or Mempool
-		log.Printf("Received TX from %s", p.Conn.RemoteAddr())
+		// Forward to Mempool
+		var tx types.Transaction
+		dec := gob.NewDecoder(bytes.NewReader(msg.Payload))
+		if err := dec.Decode(&tx); err != nil {
+			log.Printf("Invalid Tx from %s: %v", p.Conn.RemoteAddr(), err)
+			return
+		}
+		if s.Mempool != nil {
+			if s.Mempool.Add(tx) {
+				log.Printf("📥 Recv Tx %d from %s (Added to Mempool)", tx.Nonce, p.Conn.RemoteAddr())
+				// Rationale: We should also Rebroadcast efficienty. For now, simple ingest.
+			}
+		}
 	case MsgBlock:
 		s.handleBlock(p, msg.Payload)
 	case MsgGetAddr:
@@ -237,7 +256,9 @@ func (s *Server) handleBlock(p *Peer, payload []byte) {
 
 		// Apply Block Reward (Coinbase)
 		if s.Executor != nil {
-			s.Executor.ApplyBlockReward(v.Author)
+			// For now, we assume 0 fees collected in this block processing path
+			// (Real implementation would sum up fees from transactions in the block)
+			s.Executor.ApplyBlockReward(v.Author, 0)
 		}
 
 		// TODO: Re-broadcast if valid and new?
@@ -246,8 +267,8 @@ func (s *Server) handleBlock(p *Peer, payload []byte) {
 
 // Broadcast sends a message to all connected peers.
 func (s *Server) Broadcast(msg Message) {
-	s.lock.RLock()
-	defer s.lock.RUnlock()
+	s.PeersMutex.RLock()
+	defer s.PeersMutex.RUnlock()
 	for _, peer := range s.Peers {
 		go func(p *Peer) {
 			if err := p.Send(msg); err != nil {
@@ -287,7 +308,7 @@ func (s *Server) SendGetAddr(p *Peer) {
 
 // handleGetAddr responds with a list of known peers.
 func (s *Server) handleGetAddr(p *Peer) {
-	s.lock.RLock()
+	s.PeersMutex.RLock()
 	var addrs []string
 	for addr := range s.KnownPeers {
 		addrs = append(addrs, addr)
@@ -295,7 +316,7 @@ func (s *Server) handleGetAddr(p *Peer) {
 			break
 		}
 	}
-	s.lock.RUnlock()
+	s.PeersMutex.RUnlock()
 
 	data := AddrData{Addrs: addrs}
 	var buf bytes.Buffer
@@ -311,7 +332,7 @@ func (s *Server) handleAddr(p *Peer, payload []byte) {
 		return
 	}
 
-	s.lock.Lock()
+	s.PeersMutex.Lock()
 	newPeers := 0
 	for _, addr := range data.Addrs {
 		if !s.KnownPeers[addr] {
@@ -321,7 +342,7 @@ func (s *Server) handleAddr(p *Peer, payload []byte) {
 			go s.Connect(addr)
 		}
 	}
-	s.lock.Unlock()
+	s.PeersMutex.Unlock()
 
 	if newPeers > 0 {
 		log.Printf("Discovery: Received %d new peers from %s", newPeers, p.Conn.RemoteAddr())
@@ -378,10 +399,17 @@ func (s *Server) handleDAG(p *Peer, payload []byte) {
 	}
 }
 
+// GetPeer safely retrieves a peer by address.
+func (s *Server) GetPeer(addr string) *Peer {
+	s.PeersMutex.RLock()
+	defer s.PeersMutex.RUnlock()
+	return s.Peers[addr]
+}
+
 // AddPeer safely adds a peer to the map.
 func (s *Server) AddPeer(p *Peer) {
-	s.lock.Lock()
-	defer s.lock.Unlock()
+	s.PeersMutex.Lock()
+	defer s.PeersMutex.Unlock()
 	addr := p.Conn.RemoteAddr().String()
 	s.Peers[addr] = p
 	s.KnownPeers[addr] = true // Add to known list
@@ -389,8 +417,8 @@ func (s *Server) AddPeer(p *Peer) {
 
 // RemovePeer safely removes a peer.
 func (s *Server) RemovePeer(addr string) {
-	s.lock.Lock()
-	defer s.lock.Unlock()
+	s.PeersMutex.Lock()
+	defer s.PeersMutex.Unlock()
 	if peer, ok := s.Peers[addr]; ok {
 		peer.Close()
 		delete(s.Peers, addr)

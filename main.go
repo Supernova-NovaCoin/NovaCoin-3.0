@@ -72,7 +72,6 @@ func main() {
 	fmt.Printf("📦 Database initialized at %s\n", dbPath)
 
 	// 1. Initialize State (Memory Bank)
-
 	state := execution.NewStateManager()
 	executor := execution.NewExecutor(state)
 	fmt.Printf("✅ State Manager Initialized (0-Copy Mode). Executor: %v\n", executor)
@@ -81,14 +80,18 @@ func main() {
 	dag := pulse.NewVertexStore()
 	fmt.Printf("✅ Pulse DAG Initialized. Tips: %d\n", len(dag.GetTips()))
 
-	// 3. Initialize TPU (Ingest)
-	// 3. Initialize TPU (Ingest)
-	tpuServer, err := tpu.NewIngestServer(*udpPort)
+	// 3. Initialize Mempool
+	mempool := tpu.NewMempool()
+	fmt.Printf("✅ Mempool Initialized\n")
+
+	// 4. Initialize TPU (Ingest)
+	// We need to pass mempool to ingestion so UDP txs go there
+	tpuServer, err := tpu.NewIngestServer(*udpPort, mempool)
 	if err != nil {
 		panic(err)
 	}
 
-	// 4. "Big Bang": Genesis Allocation (Multi-Validator)
+	// 5. "Big Bang": Genesis Allocation (Multi-Validator)
 	// Validator 1: Singapore (Dev Key)
 	genSeed1 := make([]byte, 32)
 	copy(genSeed1, []byte("supernova-genesis-seed-key-12345"))
@@ -153,7 +156,28 @@ func main() {
 	fmt.Printf("5. UK:        %x\n", genID5[:4])
 
 	// 5. Initialize P2P Network
-	p2pServer := p2p.NewServer(*p2pPort, *maxPeers, dag, state, executor)
+	// Derive NodeID from the Identity Key we are using
+	var identitySeed []byte
+	if *minerKey != "" {
+		// 1. User specified key
+		decoded, err := hex.DecodeString(*minerKey)
+		if err == nil && len(decoded) == 32 {
+			identitySeed = decoded
+		}
+	}
+
+	if len(identitySeed) == 0 {
+		// 2. Default to Genesis 1 (Dev Mode)
+		identitySeed = genSeed1
+	}
+
+	// Derive Public Key from Seed
+	idKeys := ed25519.NewKeyFromSeed(identitySeed)
+	idPub := idKeys.Public().(ed25519.PublicKey)
+	nodeID := hex.EncodeToString(idPub)
+
+	// In a real app, we load the "Self" key.
+	p2pServer := p2p.NewServer(*p2pPort, *maxPeers, nodeID, dag, state, executor, mempool)
 
 	// Start the Engine components
 	go tpuServer.Start()
@@ -165,7 +189,7 @@ func main() {
 	}()
 
 	// 6. Start API Server (Background)
-	go startExplorerAPI(dag, state)
+	go startExplorerAPI(dag, state, mempool, p2pServer)
 
 	// Connect to peers
 	if *peers != "" {
@@ -214,13 +238,98 @@ func main() {
 					tips = []pulse.Hash{{}}
 				}
 
+				// 1. Get Txs from Mempool
+				txs := mempool.GetBatch(100)
+
+				// 2. Serialize Payload
+				var payloadBuf bytes.Buffer
+				if len(txs) > 0 {
+					if err := gob.NewEncoder(&payloadBuf).Encode(txs); err != nil {
+						fmt.Printf("Miner Error encoding txs: %v\n", err)
+					}
+				} else {
+					payloadBuf.Write([]byte("mined-block")) // Empty block (keep alive)
+				}
+
 				// Create new vertex (Signed)
-				v := pulse.NewVertex(tips, minerPub, minerPriv, []byte("mined-block"))
+				v := pulse.NewVertex(tips, minerPub, minerPriv, payloadBuf.Bytes())
 				dag.AddVertex(v)
-				fmt.Printf("⛏️  Mined new Vertex: %s (Parents: %d)\n", v.Hash.String()[:8], len(v.Parents))
+				fmt.Printf("⛏️  Mined new Vertex: %s (Parents: %d, Txs: %d)\n", v.Hash.String()[:8], len(v.Parents), len(txs))
 
 				// Broadcast
 				p2pServer.BroadcastBlock(v)
+
+				// AUTO-FUND BOT: If we are Genesis 1 (Singapore), grant licenses to new peers
+				// We check peer list. If they have 0 GrantStake, we send TxGrant.
+				// For prototype: we just iterate known peers and check state.
+				// Only do this if we hold the Genesis 1 key.
+				if bytes.Equal(seed, genSeed1) {
+					p2pServer.PeersMutex.RLock()
+					peers := make([]string, 0, len(p2pServer.Peers))
+					for addr := range p2pServer.Peers {
+						peers = append(peers, addr)
+					}
+					p2pServer.PeersMutex.RUnlock()
+
+					for _, peerAddrStr := range peers {
+						// This is IP address strings. In real P2P, we need their ID/Pubkey.
+						// Our Handshake has the NodeID (which we set to PubKey Hex in main).
+						// So we need to access peer.NodeID.
+						peer := p2pServer.GetPeer(peerAddrStr)
+						if peer == nil || peer.NodeID == "" {
+							continue
+						}
+
+						pubBytes, err := hex.DecodeString(peer.NodeID)
+						if err != nil || len(pubBytes) != 32 {
+							continue
+						}
+						var peerPub [32]byte
+						copy(peerPub[:], pubBytes)
+
+						// Check if they need a grant
+						if state.GetGrantStake(peerPub) == 0 {
+							// Grant 1000 NVN
+							grantAmount := uint64(1000 * 1_000_000)
+							// Construct Tx
+							tx := types.Transaction{
+								Type:   types.TxGrant,
+								From:   [32]byte(minerPub), // Genesis
+								To:     peerPub,            // User
+								Amount: grantAmount,
+								Fee:    0, // Free for Genesis
+								Nonce:  uint64(time.Now().UnixNano()),
+							}
+
+							msg := tx.SerializeForSigning()
+							tx.Sig = ed25519.Sign(minerPriv, msg)
+
+							// Execute locally + Broadcast
+							// For simulation, we just inject to our own executor which propagates via block?
+							// Or better: Broadcast Tx
+							// We lack a BroadcastTx method on server, so we send as MsgTx?
+							// For now, simpler: Just "Direct execution" via our own miner block?
+							// Actually, miners include Txs from mempool. We don't have a mempool here yet.
+							// Short-circuit: Create a block with this Tx.
+
+							fmt.Printf("🤖 Auto-Bot: Granting License to %x...\n", peerPub[:4])
+
+							// Create a special block for this grant immediately?
+							// Or just let the loop handle it next tick?
+							// Let's just execute it on state for "Instant Finality" simulation
+							// (Network won't see it unless in block, but for demo OK).
+							// REAL WAY: Send to UDP Ingest.
+
+							var buf bytes.Buffer
+							gob.NewEncoder(&buf).Encode(tx)
+							conn, err := net.Dial("udp", fmt.Sprintf("127.0.0.1:%d", *udpPort))
+							if err == nil {
+								conn.Write(buf.Bytes())
+								conn.Close()
+							}
+						}
+					}
+				}
 			}
 		}()
 	}

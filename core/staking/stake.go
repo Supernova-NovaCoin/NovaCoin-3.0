@@ -20,9 +20,11 @@ func ValidateBlock(v *pulse.Vertex, state *execution.StateManager) error {
 	}
 
 	// 2. Verify Stake
-	authorStake := state.GetStake(v.Author)
-	if authorStake < MinStakeRequired {
-		return fmt.Errorf("insufficient stake: %d < %d", authorStake, MinStakeRequired)
+	// Voting Power = Liquid Stake + Grant License Stake
+	liquid := state.GetStake(v.Author)
+	grant := state.GetGrantStake(v.Author)
+	if liquid+grant < MinStakeRequired {
+		return fmt.Errorf("insufficient stake: %d < %d", liquid+grant, MinStakeRequired)
 	}
 	return nil
 }
