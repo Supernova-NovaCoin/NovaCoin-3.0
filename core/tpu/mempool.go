@@ -1,6 +1,7 @@
 package tpu
 
 import (
+	"novacoin/core/execution"
 	"novacoin/core/types"
 	"sync"
 )
@@ -9,12 +10,14 @@ import (
 // Typical lifecycle: P2P -> Mempool -> Miner -> Block -> Executor
 type Mempool struct {
 	Pending map[[32]byte]types.Transaction // Sig -> Tx
+	State   *execution.StateManager
 	mu      sync.RWMutex
 }
 
-func NewMempool() *Mempool {
+func NewMempool(state *execution.StateManager) *Mempool {
 	return &Mempool{
 		Pending: make(map[[32]byte]types.Transaction),
+		State:   state,
 	}
 }
 
@@ -23,6 +26,14 @@ func NewMempool() *Mempool {
 func (mp *Mempool) Add(tx types.Transaction) bool {
 	mp.mu.Lock()
 	defer mp.mu.Unlock()
+
+	// 1. Check State Nonce (Prevent Replay/Zombie Txs)
+	if mp.State != nil {
+		currentNone := mp.State.GetNonce(tx.From)
+		if tx.Nonce <= currentNone {
+			return false // Already processed
+		}
+	}
 
 	// Use Signature as ID
 	var sigID [32]byte

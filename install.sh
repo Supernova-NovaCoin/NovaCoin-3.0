@@ -45,8 +45,9 @@ echo "🚀 Launching Supernova Node..."
 echo "   P2P Port: 9000"
 echo "   API Port: 8000"
 echo "   Mining: ENABLED"
+echo "   Peers: 52.221.167.113:9000 (Singapore Genesis)"
 
-./nova -miner -minerkey "$KEY" -p2p :9000 -udp 8080 &
+./nova -miner -minerkey "$KEY" -p2p :9000 -udp 8080 -peers 52.221.167.113:9000 &
 
 PID=$!
 echo "✅ Node running (PID: $PID). View logs with: tail -f nohup.out (if redirected)"

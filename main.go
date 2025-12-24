@@ -81,8 +81,8 @@ func main() {
 	fmt.Printf("✅ Pulse DAG Initialized. Tips: %d\n", len(dag.GetTips()))
 
 	// 3. Initialize Mempool
-	mempool := tpu.NewMempool()
-	fmt.Printf("✅ Mempool Initialized\n")
+	// 3. Initialize Mempool
+	mempool := tpu.NewMempool(state)
 
 	// 4. Initialize TPU (Ingest)
 	// We need to pass mempool to ingestion so UDP txs go there
