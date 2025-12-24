@@ -219,11 +219,12 @@ func (s *Server) handleConn(conn net.Conn, outbound bool) {
 	s.AddPeer(peer)
 
 	// Trigger callback for new peer (used for auto-grant)
+	// MUST be synchronous to ensure grant is applied BEFORE processing blocks
 	if s.OnPeerConnected != nil {
-		go s.OnPeerConnected(peer.NodeID)
+		s.OnPeerConnected(peer.NodeID)
 	}
 
-	// Start read loop
+	// Start read loop (after grant is applied)
 	go s.readLoop(peer)
 
 	// Discovery: Ask for more peers
