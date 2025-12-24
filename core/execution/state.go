@@ -219,6 +219,16 @@ func (sm *StateManager) SetGrantStake(addr [32]byte, amount uint64) {
 	sm.persistAccount(acc)
 }
 
+// AddGrantStake adds to the locked license stake (thread-safe)
+func (sm *StateManager) AddGrantStake(addr [32]byte, amount uint64) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	acc := sm.getOrCreateAccountLocked(addr)
+	acc.GrantStake += amount
+	sm.persistAccount(acc)
+}
+
 // GetDelegation returns the amount delegated to a specific validator (thread-safe)
 func (sm *StateManager) GetDelegation(delegator [32]byte, validator [32]byte) uint64 {
 	sm.mu.Lock()

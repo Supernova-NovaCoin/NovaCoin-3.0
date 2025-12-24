@@ -66,7 +66,7 @@ deploy_validator() {
     SEED=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i "$KEY" "$USER@$IP" "openssl rand -hex 32" 2>/dev/null)
     echo "  Seed: $SEED"
 
-    # Create service file
+    # Create service file (with genesis seeds for consistent state)
     echo "  Creating systemd service..."
     ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i "$KEY" "$USER@$IP" "sudo tee /etc/systemd/system/supernova.service > /dev/null" << EOF
 [Unit]
@@ -77,6 +77,12 @@ After=network.target
 Type=simple
 User=$USER
 WorkingDirectory=$DATA_DIR
+
+# Genesis seeds - required for consistent state initialization
+Environment=SUPERNOVA_GENESIS_SEED_1=bb00616aa658a469e6a62e6615365d642291119c9440c760205087371f1aae9a
+Environment=SUPERNOVA_GENESIS_SEED_2=ca7d08d833197744b3b7785347af1bcd4b8c3a2afdd3dd29df691d50d63d6239
+Environment=SUPERNOVA_GENESIS_SEED_3=0e67d464775b64fd1112dabb9b57f0220c5e6f8a471fe12e59309558d3b5cb73
+
 ExecStart=$DATA_DIR/nova -miner -minerkey $SEED -p2p :9000 -udp 8080 -peers $GENESIS_PEERS
 Restart=always
 RestartSec=10

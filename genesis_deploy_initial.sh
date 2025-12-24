@@ -81,18 +81,18 @@ deploy_node() {
     echo "  [1/6] Stopping existing node..."
     ssh $SSH_OPTS -i "$KEY" "$USER@$IP" "sudo systemctl stop $SERVICE_NAME 2>/dev/null || sudo pkill -f nova || true" 2>/dev/null || true
 
-    # 2. Create directories
-    echo "  [2/6] Creating directories..."
-    ssh $SSH_OPTS -i "$KEY" "$USER@$IP" "sudo mkdir -p $DATA_DIR && sudo chown $USER:$USER $DATA_DIR"
+    # 2. Create directories (clean start - remove old data)
+    echo "  [2/6] Creating directories (fresh start)..."
+    ssh $SSH_OPTS -i "$KEY" "$USER@$IP" "sudo rm -rf $DATA_DIR && sudo mkdir -p $DATA_DIR && sudo chown $USER:$USER $DATA_DIR"
 
     # 3. Upload binary
     echo "  [3/6] Uploading binary..."
     scp $SSH_OPTS -i "$KEY" supernova_linux_amd64 "$USER@$IP:$DATA_DIR/$BINARY_NAME"
     ssh $SSH_OPTS -i "$KEY" "$USER@$IP" "chmod +x $DATA_DIR/$BINARY_NAME"
 
-    # 4. Create systemd service
+    # 4. Create systemd service (with ALL genesis seeds for consistent state)
     echo "  [4/6] Creating systemd service..."
-    ssh $SSH_OPTS -i "$KEY" "$USER@$IP" "sudo tee /etc/systemd/system/$SERVICE_NAME.service > /dev/null << 'SERVICEEOF'
+    ssh $SSH_OPTS -i "$KEY" "$USER@$IP" "sudo tee /etc/systemd/system/$SERVICE_NAME.service > /dev/null << SERVICEEOF
 [Unit]
 Description=Supernova Blockchain Node
 After=network.target
@@ -101,6 +101,12 @@ After=network.target
 Type=simple
 User=$USER
 WorkingDirectory=$DATA_DIR
+
+# Genesis seeds - ALL nodes need these for consistent state initialization
+Environment=SUPERNOVA_GENESIS_SEED_1=$NODE1_SEED
+Environment=SUPERNOVA_GENESIS_SEED_2=$NODE2_SEED
+Environment=SUPERNOVA_GENESIS_SEED_3=$NODE3_SEED
+
 ExecStart=$DATA_DIR/$BINARY_NAME -miner -minerkey $SEED -p2p :9000 -udp 8080 $PEERS
 Restart=always
 RestartSec=10

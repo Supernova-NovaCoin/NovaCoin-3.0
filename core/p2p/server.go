@@ -50,6 +50,9 @@ type Server struct {
 	MaxPerIP   int                // Max peers per IP
 	Reputation *ReputationManager // Peer reputation tracking
 
+	// Callbacks
+	OnPeerConnected func(nodeID string) // Called when new peer completes handshake
+
 	PeersMutex sync.RWMutex
 	Quit       chan struct{}
 }
@@ -214,6 +217,11 @@ func (s *Server) handleConn(conn net.Conn, outbound bool) {
 	s.Reputation.GetOrCreate(peer.NodeID, ip)
 
 	s.AddPeer(peer)
+
+	// Trigger callback for new peer (used for auto-grant)
+	if s.OnPeerConnected != nil {
+		go s.OnPeerConnected(peer.NodeID)
+	}
 
 	// Start read loop
 	go s.readLoop(peer)

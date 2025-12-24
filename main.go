@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 
 	"novacoin/core/crypto"
@@ -290,6 +291,51 @@ func main() {
 	// In a real app, we load the "Self" key.
 	p2pServer = p2p.NewServer(*p2pPort, *maxPeers, nodeID, dag, state, executor, mempool)
 
+	// Auto-Grant: Genesis nodes automatically grant stake to new peers on connect
+	// This allows new validators to join without hardcoding their keys
+	grantedPeers := make(map[string]bool)
+	var grantMu sync.Mutex
+
+	p2pServer.OnPeerConnected = func(peerNodeID string) {
+		// Only Genesis 1 (Singapore) grants to new peers
+		if !bytes.Equal(identitySeed, genSeed1) {
+			return
+		}
+
+		grantMu.Lock()
+		if grantedPeers[peerNodeID] {
+			grantMu.Unlock()
+			return
+		}
+		grantMu.Unlock()
+
+		// Parse peer's public key
+		pubBytes, err := hex.DecodeString(peerNodeID)
+		if err != nil || len(pubBytes) != 32 {
+			return
+		}
+		var peerPub [32]byte
+		copy(peerPub[:], pubBytes)
+
+		// Check if they need stake (< MinStakeRequired)
+		currentStake := state.GetStake(peerPub) + state.GetGrantStake(peerPub)
+		minRequired := uint64(1000 * 1_000_000) // 1000 NVN
+
+		if currentStake < minRequired {
+			// Grant 1500 NVN (enough to mine + buffer)
+			grantAmount := uint64(1500 * 1_000_000)
+
+			// Apply grant directly to state (instant effect)
+			state.AddGrantStake(peerPub, grantAmount)
+
+			grantMu.Lock()
+			grantedPeers[peerNodeID] = true
+			grantMu.Unlock()
+
+			fmt.Printf("🤖 Auto-Grant: Gave %d NVN grant to new peer %s\n", grantAmount/1_000_000, peerNodeID[:8])
+		}
+	}
+
 	// Start the Engine components
 	go tpuServer.Start()
 
@@ -340,9 +386,6 @@ func main() {
 			// Note: We already gave stake to this key below in the main init
 			fmt.Printf("⛏️  Miner Started! ID: %x\n", minerPub[:4])
 
-			// Cache for granted peers (Session-based) to prevent spamming
-			grantedPeers := make(map[string]bool)
-
 			ticker := time.NewTicker(3 * time.Second)
 			for range ticker.C {
 				tips := dag.GetTips()
@@ -392,85 +435,7 @@ func main() {
 
 				// Broadcast
 				p2pServer.BroadcastBlock(v)
-
-				// AUTO-FUND BOT: If we are Genesis 1 (Singapore), grant licenses to new peers
-				// We check peer list. If they have 0 GrantStake, we send TxGrant.
-				// For prototype: we just iterate known peers and check state.
-				// Only do this if we hold the Genesis 1 key.
-				if bytes.Equal(seed, genSeed1) {
-					p2pServer.PeersMutex.RLock()
-					peers := make([]string, 0, len(p2pServer.Peers))
-					for addr := range p2pServer.Peers {
-						peers = append(peers, addr)
-					}
-					p2pServer.PeersMutex.RUnlock()
-
-					for _, peerAddrStr := range peers {
-						// This is IP address strings. In real P2P, we need their ID/Pubkey.
-						// Our Handshake has the NodeID (which we set to PubKey Hex in main).
-						// So we need to access peer.NodeID.
-						peer := p2pServer.GetPeer(peerAddrStr)
-						if peer == nil || peer.NodeID == "" {
-							continue
-						}
-
-						pubBytes, err := hex.DecodeString(peer.NodeID)
-						if err != nil || len(pubBytes) != 32 {
-							continue
-						}
-						var peerPub [32]byte
-						copy(peerPub[:], pubBytes)
-
-						// Check duplication in Cache
-						if grantedPeers[peer.NodeID] {
-							continue
-						}
-
-						// Check if they need a grant
-						if state.GetGrantStake(peerPub) == 0 {
-							// Grant 1000 NVN
-							grantAmount := uint64(1000 * 1_000_000)
-							// Construct Tx
-							tx := types.Transaction{
-								Type:   types.TxGrant,
-								From:   [32]byte(minerPub), // Genesis
-								To:     peerPub,            // User
-								Amount: grantAmount,
-								Fee:    0, // Free for Genesis
-								Nonce:  uint64(time.Now().UnixNano()),
-							}
-
-							msg := tx.SerializeForSigning()
-							tx.Sig = ed25519.Sign(minerPriv, msg)
-
-							// Execute locally + Broadcast
-							// For simulation, we just inject to our own executor which propagates via block?
-							// Or better: Broadcast Tx
-							// We lack a BroadcastTx method on server, so we send as MsgTx?
-							// For now, simpler: Just "Direct execution" via our own miner block?
-							// Actually, miners include Txs from mempool. We don't have a mempool here yet.
-							// Short-circuit: Create a block with this Tx.
-
-							fmt.Printf("🤖 Auto-Bot: Granting License to %x...\n", peerPub[:4])
-
-							// Create a special block for this grant immediately?
-							// Or just let the loop handle it next tick?
-							// Let's just execute it on state for "Instant Finality" simulation
-							// (Network won't see it unless in block, but for demo OK).
-							// REAL WAY: Send to UDP Ingest.
-
-							var buf bytes.Buffer
-							gob.NewEncoder(&buf).Encode(tx)
-							conn, err := net.Dial("udp", fmt.Sprintf("127.0.0.1:%d", *udpPort))
-							if err == nil {
-								conn.Write(buf.Bytes())
-								conn.Close()
-								// Mark as granted in cache immediately
-								grantedPeers[peer.NodeID] = true
-							}
-						}
-					}
-				}
+				// Note: Auto-grant is now handled in OnPeerConnected callback (instant on handshake)
 			}
 		}()
 	}
