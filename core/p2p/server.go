@@ -2,10 +2,13 @@ package p2p
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/gob"
+	"encoding/hex"
 	"log"
 	"net"
 	"novacoin/core/execution"
+	"novacoin/core/network"
 	"novacoin/core/pulse"
 	"novacoin/core/staking"
 	"novacoin/core/tpu"
@@ -15,8 +18,18 @@ import (
 
 const (
 	ProtocolVersion = 1
-	GenesisHash     = "0000000000000000" // Placeholder, should match real genesis
 )
+
+// ComputeGenesisHash computes a deterministic genesis hash from network parameters
+func ComputeGenesisHash() string {
+	// Create a deterministic genesis hash from chain parameters
+	data := []byte("supernova-mainnet-v1-genesis-2024")
+	hash := sha256.Sum256(data)
+	return hex.EncodeToString(hash[:16]) // Use first 16 bytes
+}
+
+// GenesisHash is computed at init time
+var GenesisHash = ComputeGenesisHash()
 
 // Server manages all P2P connections and protocol logic.
 type Server struct {
@@ -29,11 +42,13 @@ type Server struct {
 	State    *execution.StateManager // Link to State for staking check
 	Executor *execution.Executor     // Link to Executor for rewards
 	Mempool  *tpu.Mempool            // Link to Mempool for Tx storage
+	Slasher  *staking.Slasher        // Link to Slasher for double-sign detection
 
 	// Security / DDoS Protection
-	ConnCount map[string]int // Count of connections per IP
-	MaxPeers  int            // Total max peers
-	MaxPerIP  int            // Max peers per IP
+	ConnCount  map[string]int     // Count of connections per IP
+	MaxPeers   int                // Total max peers
+	MaxPerIP   int                // Max peers per IP
+	Reputation *ReputationManager // Peer reputation tracking
 
 	PeersMutex sync.RWMutex
 	Quit       chan struct{}
@@ -49,6 +64,8 @@ func NewServer(addr string, maxPeers int, nodeID string, dag *pulse.VertexStore,
 		ConnCount:  make(map[string]int),
 		MaxPeers:   maxPeers,
 		MaxPerIP:   5, // Strict per-IP Limit (Hardcoded for now)
+		Reputation: NewReputationManager(),
+		Slasher:    staking.NewSlasher(nil), // Use default slashing config
 
 		DAG:      dag,
 		State:    state,
@@ -95,6 +112,14 @@ func (s *Server) acceptLoop() {
 
 			// DDoS Check 2: Max Per IP
 			ip, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
+
+			// Reputation Check: Is this IP banned?
+			if s.Reputation.IsAddressBanned(ip) {
+				log.Printf("🚫 Reputation: Dropped conn from banned IP %s", ip)
+				conn.Close()
+				continue
+			}
+
 			s.PeersMutex.Lock()
 			count := s.ConnCount[ip]
 			if count >= s.MaxPerIP {
@@ -176,6 +201,18 @@ func (s *Server) handleConn(conn net.Conn, outbound bool) {
 	log.Printf("Handshake success with %s (Ver: %d)", conn.RemoteAddr(), remoteHS.Version)
 
 	peer.NodeID = remoteHS.NodeID
+
+	// Check if this peer is banned by NodeID
+	if s.Reputation.IsBanned(peer.NodeID) {
+		log.Printf("🚫 Reputation: Rejected banned peer %s", peer.NodeID)
+		conn.Close()
+		return
+	}
+
+	// Register peer with reputation system
+	ip, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
+	s.Reputation.GetOrCreate(peer.NodeID, ip)
+
 	s.AddPeer(peer)
 
 	// Start read loop
@@ -189,7 +226,10 @@ func (s *Server) handleConn(conn net.Conn, outbound bool) {
 }
 
 func (s *Server) readLoop(p *Peer) {
-	defer s.RemovePeer(p.Conn.RemoteAddr().String())
+	defer func() {
+		s.Reputation.RecordDisconnect(p.NodeID)
+		s.RemovePeer(p.Conn.RemoteAddr().String())
+	}()
 	for {
 		msg, err := p.Read()
 		if err != nil {
@@ -200,20 +240,44 @@ func (s *Server) readLoop(p *Peer) {
 	}
 }
 
+// GetReputationStats returns peer reputation statistics
+func (s *Server) GetReputationStats() ReputationStats {
+	return s.Reputation.Stats()
+}
+
+// GetPeerReputations returns all peer reputations
+func (s *Server) GetPeerReputations() []*PeerReputation {
+	return s.Reputation.GetAllReputations()
+}
+
 func (s *Server) handleMessage(p *Peer, msg Message) {
+	// Validate payload size first
+	if err := network.ValidatePayloadSize(msg.Payload, network.MaxMessageSize); err != nil {
+		log.Printf("⚠️ Message too large from %s: %d bytes", p.Conn.RemoteAddr(), len(msg.Payload))
+		s.Reputation.RecordProtocolError(p.NodeID)
+		return
+	}
+
 	switch msg.Type {
 	case MsgTx:
-		// Forward to Mempool
+		// Validate TX size
+		if err := network.ValidatePayloadSize(msg.Payload, network.MaxTxSize); err != nil {
+			log.Printf("⚠️ TX too large from %s", p.Conn.RemoteAddr())
+			s.Reputation.RecordInvalidTx(p.NodeID)
+			return
+		}
+
+		// Forward to Mempool with safe decoding
 		var tx types.Transaction
-		dec := gob.NewDecoder(bytes.NewReader(msg.Payload))
-		if err := dec.Decode(&tx); err != nil {
+		if err := network.SafeDecodeTransaction(msg.Payload, &tx); err != nil {
 			log.Printf("Invalid Tx from %s: %v", p.Conn.RemoteAddr(), err)
+			s.Reputation.RecordInvalidTx(p.NodeID)
 			return
 		}
 		if s.Mempool != nil {
 			if s.Mempool.Add(tx) {
 				log.Printf("📥 Recv Tx %d from %s (Added to Mempool)", tx.Nonce, p.Conn.RemoteAddr())
-				// Rationale: We should also Rebroadcast efficienty. For now, simple ingest.
+				s.Reputation.RecordValidTx(p.NodeID)
 			}
 		}
 	case MsgBlock:
@@ -233,22 +297,67 @@ func (s *Server) handleMessage(p *Peer, msg Message) {
 
 // handleBlock processes incoming vertices.
 func (s *Server) handleBlock(p *Peer, payload []byte) {
+	// Validate block size
+	if err := network.ValidatePayloadSize(payload, network.MaxBlockSize); err != nil {
+		log.Printf("⚠️ Block too large from %s: %d bytes", p.Conn.RemoteAddr(), len(payload))
+		s.Reputation.RecordProtocolError(p.NodeID)
+		return
+	}
+
 	var v pulse.Vertex
-	dec := gob.NewDecoder(bytes.NewReader(payload))
-	if err := dec.Decode(&v); err != nil {
+	if err := network.SafeDecodeBlock(payload, &v); err != nil {
 		log.Printf("Failed to decode block from %s: %v", p.Conn.RemoteAddr(), err)
+		s.Reputation.RecordProtocolError(p.NodeID)
 		return
 	}
 
 	log.Printf("Received Vertex %s from %s", v.Hash.String(), p.Conn.RemoteAddr())
 
+	// Check if we already have this vertex (skip if duplicate)
+	if s.DAG != nil && s.DAG.HasVertex(v.Hash) {
+		return // Already have it, don't process or rebroadcast
+	}
+
 	// Validate Block (Proof-of-Stake)
 	if s.State != nil {
 		if err := staking.ValidateBlock(&v, s.State); err != nil {
 			log.Printf("⚠️ Block Rejected from %s: %v", p.Conn.RemoteAddr(), err)
+			s.Reputation.RecordInvalidBlock(p.NodeID)
 			return
 		}
 	}
+
+	// Check for double-signing (slashing condition)
+	if s.Slasher != nil {
+		isDoubleSign, slashRecord := s.Slasher.RecordBlockSigned(&v)
+		if isDoubleSign && slashRecord != nil {
+			log.Printf("🚨 DOUBLE-SIGN DETECTED: Validator %x signed conflicting blocks at round %d",
+				v.Author[:4], v.Round)
+
+			// Apply slashing if we have state access
+			if s.State != nil {
+				stake := s.State.GetStake(v.Author)
+				if stake > 0 {
+					slashAmount, err := s.Slasher.Slash(v.Author, stake, staking.OffenseDoubleSign, v.Timestamp)
+					if err == nil && slashAmount > 0 {
+						// Reduce stake in state
+						newStake := stake - slashAmount
+						if newStake > stake { // Underflow check
+							newStake = 0
+						}
+						s.State.SetStake(v.Author, newStake)
+						log.Printf("⚠️ Slashed validator %x: %d NVN", v.Author[:4], slashAmount/1_000_000)
+					}
+				}
+			}
+			// Reject the duplicate block
+			s.Reputation.RecordInvalidBlock(p.NodeID)
+			return
+		}
+	}
+
+	// Valid block - update reputation
+	s.Reputation.RecordValidBlock(p.NodeID)
 
 	// Add to local DAG
 	if s.DAG != nil {
@@ -256,12 +365,44 @@ func (s *Server) handleBlock(p *Peer, payload []byte) {
 
 		// Apply Block Reward (Coinbase)
 		if s.Executor != nil {
-			// For now, we assume 0 fees collected in this block processing path
-			// (Real implementation would sum up fees from transactions in the block)
-			s.Executor.ApplyBlockReward(v.Author, 0)
+			// Calculate fees from transactions in the block
+			var fees uint64 = 0
+			var txs []types.Transaction
+			if err := gob.NewDecoder(bytes.NewReader(v.TxPayload)).Decode(&txs); err == nil {
+				for _, tx := range txs {
+					fees += tx.Fee
+				}
+			}
+			s.Executor.ApplyBlockReward(v.Author, fees, v.Timestamp)
 		}
 
-		// TODO: Re-broadcast if valid and new?
+		// Re-broadcast to other peers (excluding sender)
+		s.RebroadcastBlock(&v, p.Conn.RemoteAddr().String())
+	}
+}
+
+// RebroadcastBlock sends a block to all peers except the sender
+func (s *Server) RebroadcastBlock(v *pulse.Vertex, excludeAddr string) {
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(v); err != nil {
+		log.Printf("Failed to encode block for rebroadcast: %v", err)
+		return
+	}
+
+	msg := Message{Type: MsgBlock, Payload: buf.Bytes()}
+
+	s.PeersMutex.RLock()
+	defer s.PeersMutex.RUnlock()
+
+	for addr, peer := range s.Peers {
+		if addr == excludeAddr {
+			continue // Don't send back to sender
+		}
+		go func(p *Peer) {
+			if err := p.Send(msg); err != nil {
+				log.Printf("Failed to rebroadcast to %s: %v", p.Conn.RemoteAddr(), err)
+			}
+		}(peer)
 	}
 }
 

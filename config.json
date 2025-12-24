@@ -1,0 +1,9 @@
+{
+    "p2p_port": ":9000",
+    "udp_port": 8080,
+    "max_peers": 100,
+    "max_per_ip": 5,
+    "genesis_seed_1": "supernova-genesis-seed-key-12345",
+    "genesis_seed_2": "3456dd1fde79a7e4da4c22897cff695db252aba429ea715b68a2b8e6aaf78fdb",
+    "genesis_seed_3": "acc7c020b65d1d18f63b1e8cbabec25f1a755006759ced445c06c4c8bbb9be32"
+}

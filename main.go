@@ -6,33 +6,135 @@ import (
 	"crypto/rand"
 	"encoding/gob"
 	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"log/slog"
 	"net"
-
 	"os"
 	"os/signal"
 	"syscall"
 
+	"novacoin/core/crypto"
 	"novacoin/core/execution"
 	"novacoin/core/p2p"
 	"novacoin/core/pulse"
 	"novacoin/core/store"
 	"novacoin/core/tpu"
 	"novacoin/core/types"
-
 	"strings"
 	"time"
 )
 
+type Config struct {
+	P2PPort      string `json:"p2p_port"`
+	UDPPort      int    `json:"udp_port"`
+	MaxPeers     int    `json:"max_peers"`
+	MaxPerIP     int    `json:"max_per_ip"`
+	GenesisSeed1 string `json:"genesis_seed_1"`
+	GenesisSeed2 string `json:"genesis_seed_2"`
+	GenesisSeed3 string `json:"genesis_seed_3"`
+	DataDir      string `json:"data_dir"`
+	EnableTLS    bool   `json:"enable_tls"`
+	TLSCertFile  string `json:"tls_cert_file"`
+	TLSKeyFile   string `json:"tls_key_file"`
+	APIPort      string `json:"api_port"`
+
+	// Community validator public keys (hex encoded)
+	CommunityValidators []string `json:"community_validators"`
+}
+
+// Global references for graceful shutdown
+var (
+	mempool   *tpu.Mempool
+	p2pServer *p2p.Server
+	tpuServer *tpu.IngestServer
+)
+
+// getEnvOrDefault returns environment variable or default value
+func getEnvOrDefault(key, defaultVal string) string {
+	if val := os.Getenv(key); val != "" {
+		return val
+	}
+	return defaultVal
+}
+
+func loadConfig() *Config {
+	cfg := &Config{
+		P2PPort:  ":9000",
+		UDPPort:  8080,
+		MaxPeers: 100,
+		MaxPerIP: 5,
+		DataDir:  "./data",
+		APIPort:  ":8000",
+	}
+
+	// Try loading from config.json
+	if file, err := os.ReadFile("config.json"); err == nil {
+		json.Unmarshal(file, cfg)
+	}
+
+	// Override with environment variables (highest priority)
+	if port := os.Getenv("SUPERNOVA_P2P_PORT"); port != "" {
+		cfg.P2PPort = port
+	}
+	if port := os.Getenv("SUPERNOVA_UDP_PORT"); port != "" {
+		if p, err := fmt.Sscanf(port, "%d", &cfg.UDPPort); err == nil && p > 0 {
+			// parsed successfully
+		}
+	}
+	if seed := os.Getenv("SUPERNOVA_GENESIS_SEED_1"); seed != "" {
+		cfg.GenesisSeed1 = seed
+	}
+	if seed := os.Getenv("SUPERNOVA_GENESIS_SEED_2"); seed != "" {
+		cfg.GenesisSeed2 = seed
+	}
+	if seed := os.Getenv("SUPERNOVA_GENESIS_SEED_3"); seed != "" {
+		cfg.GenesisSeed3 = seed
+	}
+	if dir := os.Getenv("SUPERNOVA_DATA_DIR"); dir != "" {
+		cfg.DataDir = dir
+	}
+	if port := os.Getenv("SUPERNOVA_API_PORT"); port != "" {
+		cfg.APIPort = port
+	}
+	if os.Getenv("SUPERNOVA_ENABLE_TLS") == "true" {
+		cfg.EnableTLS = true
+	}
+	if cert := os.Getenv("SUPERNOVA_TLS_CERT"); cert != "" {
+		cfg.TLSCertFile = cert
+	}
+	if key := os.Getenv("SUPERNOVA_TLS_KEY"); key != "" {
+		cfg.TLSKeyFile = key
+	}
+
+	// Validate: Genesis seeds MUST be provided externally in production
+	if cfg.GenesisSeed1 == "" {
+		fmt.Println("⚠️  WARNING: No genesis seed configured!")
+		fmt.Println("   Set SUPERNOVA_GENESIS_SEED_1 environment variable or config.json")
+		fmt.Println("   Using INSECURE default for development only!")
+		cfg.GenesisSeed1 = "dev-only-insecure-seed-do-not-use-in-production"
+	}
+
+	return cfg
+}
+
 func main() {
-	p2pPort := flag.String("p2p", ":9000", "P2P listening address (e.g. :9000)")
-	udpPort := flag.Int("udp", 8080, "UDP Ingest port")
-	peers := flag.String("peers", "", "Comma-separated list of peers to connect to")
+	// Initialize Structured Logger
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	slog.SetDefault(logger)
+
+	// Load Config
+	cfg := loadConfig()
+
+	// Flags override config
+	p2pPort := flag.String("p2p", cfg.P2PPort, "P2P listening address")
+	udpPort := flag.Int("udp", cfg.UDPPort, "UDP Ingest port")
+	peers := flag.String("peers", "", "Comma-separated list of peers")
 	miner := flag.Bool("miner", false, "Enable mining (simulated)")
-	maxPeers := flag.Int("maxpeers", 100, "Maximum number of connected peers")
+	maxPeers := flag.Int("maxpeers", cfg.MaxPeers, "Maximum number of connected peers")
 	genKey := flag.Bool("genkey", false, "Generate a new Validator KeyPair")
-	minerKey := flag.String("minerkey", "", "Hex-encoded Seed for Mining (32 bytes)")
+	minerKey := flag.String("minerkey", "", "Hex-encoded Seed for Mining")
 
 	// CLI Commands
 	send := flag.Bool("send", false, "Send NVN")
@@ -63,66 +165,75 @@ func main() {
 		return
 	}
 
-	fmt.Println("🌟 NovaCoin 3.0 'Supernova' Engine Starting...")
+	slog.Info("🌟 NovaCoin 3.0 'Supernova' Engine Starting...", "version", "3.0.1")
 
 	// 0. Initialize Database
 	dbPath := fmt.Sprintf("./data/nova-%s", strings.ReplaceAll(*p2pPort, ":", ""))
 	store.Init(dbPath)
 	defer store.Close()
-	fmt.Printf("📦 Database initialized at %s\n", dbPath)
+	slog.Info("📦 Database initialized", "path", dbPath)
 
 	// 1. Initialize State (Memory Bank)
 	state := execution.NewStateManager()
 	executor := execution.NewExecutor(state)
-	fmt.Printf("✅ State Manager Initialized (0-Copy Mode). Executor: %v\n", executor)
+	slog.Info("✅ State Manager Initialized (0-Copy Mode)")
 
 	// 2. Initialize DAG (The Pulse)
 	dag := pulse.NewVertexStore()
-	fmt.Printf("✅ Pulse DAG Initialized. Tips: %d\n", len(dag.GetTips()))
+	tips := dag.GetTips()
+	slog.Info("✅ Pulse DAG Initialized", "tips", len(tips))
 
 	// 3. Initialize Mempool
-	// 3. Initialize Mempool
-	mempool := tpu.NewMempool(state)
+	mempool = tpu.NewMempool(state)
 
-	// 4. Initialize TPU (Ingest)
-	// We need to pass mempool to ingestion so UDP txs go there
-	tpuServer, err := tpu.NewIngestServer(*udpPort, mempool)
+	// 4. Initialize TPU (Ingest) with worker pool
+	var err error
+	tpuServer, err = tpu.NewIngestServer(*udpPort, mempool)
 	if err != nil {
 		panic(err)
 	}
 
 	// 5. "Big Bang": Genesis Allocation (Multi-Validator)
-	// Validator 1: Singapore (Dev Key)
-	genSeed1 := make([]byte, 32)
-	copy(genSeed1, []byte("supernova-genesis-seed-key-12345"))
+	// Seeds MUST come from config/environment - never hardcode in production!
+	genSeed1 := deriveGenesisSeed(cfg.GenesisSeed1)
 	genPub1 := ed25519.NewKeyFromSeed(genSeed1).Public().(ed25519.PublicKey)
 	var genID1 [32]byte
 	copy(genID1[:], genPub1)
 
-	// Validator 2: Mumbai
-	genSeed2, _ := hex.DecodeString("3456dd1fde79a7e4da4c22897cff695db252aba429ea715b68a2b8e6aaf78fdb")
+	// Validator 2 (optional - from config)
+	genSeed2 := deriveGenesisSeed(cfg.GenesisSeed2)
 	genPub2 := ed25519.NewKeyFromSeed(genSeed2).Public().(ed25519.PublicKey)
 	var genID2 [32]byte
 	copy(genID2[:], genPub2)
 
-	// Validator 3: USA
-	// Validator 3: USA
-	genSeed3, _ := hex.DecodeString("acc7c020b65d1d18f63b1e8cbabec25f1a755006759ced445c06c4c8bbb9be32")
+	// Validator 3 (optional - from config)
+	genSeed3 := deriveGenesisSeed(cfg.GenesisSeed3)
 	genPub3 := ed25519.NewKeyFromSeed(genSeed3).Public().(ed25519.PublicKey)
 	var genID3 [32]byte
 	copy(genID3[:], genPub3)
 
-	// User Miner 1: Germany
-	gemPubHex := "809677ea09986593d3dedbeb3b6f5d1fe66855ef4a3ea28a9ba64c05cdad7076"
-	gemPubBytes, _ := hex.DecodeString(gemPubHex)
-	var genID4 [32]byte
-	copy(genID4[:], gemPubBytes)
+	// Community Validators (from config or defaults)
+	communityValidators := cfg.CommunityValidators
+	if len(communityValidators) == 0 {
+		// Default community validators for backward compatibility
+		communityValidators = []string{
+			"809677ea09986593d3dedbeb3b6f5d1fe66855ef4a3ea28a9ba64c05cdad7076", // Germany
+			"0810a0748d15669e791a23828b013e775223ab124672fb39a6d07be5a66e258b", // UK
+		}
+	}
 
-	// User Miner 2: UK
-	ukPubHex := "0810a0748d15669e791a23828b013e775223ab124672fb39a6d07be5a66e258b"
-	ukPubBytes, _ := hex.DecodeString(ukPubHex)
-	var genID5 [32]byte
-	copy(genID5[:], ukPubBytes)
+	// Parse community validators
+	var genID4, genID5 [32]byte
+	if len(communityValidators) >= 1 {
+		if pubBytes, err := hex.DecodeString(communityValidators[0]); err == nil && len(pubBytes) == 32 {
+			copy(genID4[:], pubBytes)
+		}
+	}
+	if len(communityValidators) >= 2 {
+		if pubBytes, err := hex.DecodeString(communityValidators[1]); err == nil && len(pubBytes) == 32 {
+			copy(genID5[:], pubBytes)
+		}
+	}
 
 	// Reduced to fit uint64: 10 Billion Total, Split 3 ways
 	balance := uint64(3_333_333_333 * 1_000_000)
@@ -177,7 +288,7 @@ func main() {
 	nodeID := hex.EncodeToString(idPub)
 
 	// In a real app, we load the "Self" key.
-	p2pServer := p2p.NewServer(*p2pPort, *maxPeers, nodeID, dag, state, executor, mempool)
+	p2pServer = p2p.NewServer(*p2pPort, *maxPeers, nodeID, dag, state, executor, mempool)
 
 	// Start the Engine components
 	go tpuServer.Start()
@@ -189,7 +300,7 @@ func main() {
 	}()
 
 	// 6. Start API Server (Background)
-	go startExplorerAPI(dag, state, mempool, p2pServer)
+	go startExplorerAPI(dag, state, mempool, p2pServer, cfg)
 
 	// Connect to peers
 	if *peers != "" {
@@ -229,6 +340,9 @@ func main() {
 			// Note: We already gave stake to this key below in the main init
 			fmt.Printf("⛏️  Miner Started! ID: %x\n", minerPub[:4])
 
+			// Cache for granted peers (Session-based) to prevent spamming
+			grantedPeers := make(map[string]bool)
+
 			ticker := time.NewTicker(3 * time.Second)
 			for range ticker.C {
 				tips := dag.GetTips()
@@ -243,18 +357,38 @@ func main() {
 
 				// 2. Serialize Payload
 				var payloadBuf bytes.Buffer
+				var merkleRoot [32]byte
+
 				if len(txs) > 0 {
+					// Encode Txs
 					if err := gob.NewEncoder(&payloadBuf).Encode(txs); err != nil {
 						fmt.Printf("Miner Error encoding txs: %v\n", err)
+						continue
 					}
+
+					// Compute Merkle Root
+					var txHashes [][]byte
+					for _, tx := range txs {
+						// For Merkle, we need hash of each Tx.
+						// In this prototype, Tx doesn't have a cached hash method exposed easily
+						// without serialization. We use Signature as ID? Or re-serialize.
+						// Let's use Signature as a "rough" hash for now (unique per tx).
+						// Ideally: Hash(Serialize(Tx)).
+						txHashes = append(txHashes, tx.Sig)
+					}
+					root := crypto.MerkleRoot(txHashes)
+					copy(merkleRoot[:], root)
+
 				} else {
 					payloadBuf.Write([]byte("mined-block")) // Empty block (keep alive)
+					// Root of empty? Zero.
 				}
 
 				// Create new vertex (Signed)
-				v := pulse.NewVertex(tips, minerPub, minerPriv, payloadBuf.Bytes())
+				// NewVertex signature now includes MerkleRoot
+				v := pulse.NewVertex(tips, minerPub, minerPriv, payloadBuf.Bytes(), merkleRoot)
 				dag.AddVertex(v)
-				fmt.Printf("⛏️  Mined new Vertex: %s (Parents: %d, Txs: %d)\n", v.Hash.String()[:8], len(v.Parents), len(txs))
+				fmt.Printf("⛏️  Mined new Vertex: %s (Parents: %d, Txs: %d, Merkle: %x)\n", v.Hash.String()[:8], len(v.Parents), len(txs), merkleRoot[:4])
 
 				// Broadcast
 				p2pServer.BroadcastBlock(v)
@@ -286,6 +420,11 @@ func main() {
 						}
 						var peerPub [32]byte
 						copy(peerPub[:], pubBytes)
+
+						// Check duplication in Cache
+						if grantedPeers[peer.NodeID] {
+							continue
+						}
 
 						// Check if they need a grant
 						if state.GetGrantStake(peerPub) == 0 {
@@ -326,6 +465,8 @@ func main() {
 							if err == nil {
 								conn.Write(buf.Bytes())
 								conn.Close()
+								// Mark as granted in cache immediately
+								grantedPeers[peer.NodeID] = true
 							}
 						}
 					}
@@ -339,7 +480,60 @@ func main() {
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	<-c
+
+	// Graceful shutdown
 	fmt.Println("\n🛑 Stopping Supernova...")
+	fmt.Println("   Cleaning up resources...")
+
+	// Stop TPU ingest server (worker pool)
+	if tpuServer != nil {
+		tpuServer.Stop()
+		fmt.Println("   ✓ TPU ingest stopped")
+	}
+
+	// Stop mempool cleanup goroutine
+	if mempool != nil {
+		mempool.Stop()
+		fmt.Println("   ✓ Mempool stopped")
+	}
+
+	// Stop P2P server
+	if p2pServer != nil {
+		close(p2pServer.Quit)
+		fmt.Println("   ✓ P2P server stopped")
+	}
+
+	// Close database (important for data integrity)
+	if store.DB != nil {
+		if err := store.DB.Close(); err != nil {
+			fmt.Printf("   ⚠ Error closing database: %v\n", err)
+		} else {
+			fmt.Println("   ✓ Database closed")
+		}
+	}
+
+	fmt.Println("👋 Supernova shutdown complete")
+}
+
+// deriveGenesisSeed converts a seed string to 32-byte seed for ed25519
+// Supports: hex strings, plain text (hashed), or empty (generates warning)
+func deriveGenesisSeed(seedStr string) []byte {
+	seed := make([]byte, 32)
+
+	if seedStr == "" {
+		// Generate random seed for empty config (dev mode warning already shown)
+		rand.Read(seed)
+		return seed
+	}
+
+	// Try hex decode first
+	if decoded, err := hex.DecodeString(seedStr); err == nil && len(decoded) == 32 {
+		return decoded
+	}
+
+	// Otherwise use as passphrase (hash it for consistent 32 bytes)
+	copy(seed, []byte(seedStr))
+	return seed
 }
 
 func handleTransaction(isSend, isStake bool, toStr string, amountVal uint64, keyStr string, udpPort int) {

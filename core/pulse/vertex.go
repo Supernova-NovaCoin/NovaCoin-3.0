@@ -3,8 +3,8 @@ package pulse
 import (
 	"crypto/ed25519"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
-	"strconv"
 	"time"
 )
 
@@ -18,10 +18,11 @@ func (h Hash) String() string {
 // Vertex replaces the traditional "Block".
 // It is a node in the DAG that points to multiple previous vertices.
 type Vertex struct {
-	Timestamp int64
-	Parents   []Hash   // References to previous tips of the DAG
-	Author    [32]byte // Ed25519 Public Key of the validator
-	TxPayload []byte   // In a real impl, this would be a Merkle Root or list of Tx Hashes
+	Timestamp  int64
+	Parents    []Hash   // References to previous tips of the DAG
+	Author     [32]byte // Ed25519 Public Key of the validator
+	TxPayload  []byte   // In a real impl, this would be a Merkle Root or list of Tx Hashes
+	MerkleRoot [32]byte // Cryptographic proof of TxPayload integrity
 
 	// Consensus Data
 	Round     uint64 // The logical round this vertex typically belongs to
@@ -29,25 +30,32 @@ type Vertex struct {
 	Hash      Hash   // Self hash
 }
 
-func NewVertex(parents []Hash, author ed25519.PublicKey, privKey ed25519.PrivateKey, payload []byte) *Vertex {
+func NewVertex(parents []Hash, author ed25519.PublicKey, privKey ed25519.PrivateKey, payload []byte, merkleRoot [32]byte) *Vertex {
 	v := &Vertex{
-		Timestamp: time.Now().UnixNano(),
-		Parents:   parents,
-		Author:    [32]byte(author),
-		TxPayload: payload,
-		Round:     0, // To be calculated based on parents
+		Timestamp:  time.Now().UnixNano(), // Genesis/Miner creates time, but Executor must use it
+		Parents:    parents,
+		Author:     [32]byte(author),
+		TxPayload:  payload,
+		MerkleRoot: merkleRoot,
+		Round:      0,
 	}
+	// Sort parents for deterministic hashing? For now, we assume miner provided order is canonical.
 	v.Hash = v.ComputeHash()
 	v.Signature = ed25519.Sign(privKey, v.Hash[:])
 	return v
 }
 
 func (v *Vertex) ComputeHash() Hash {
-	// Simple serialization for hashing (Prototype)
-	// In production, use high-performance serialization (e.g., Cap'n Proto)
-	record := string(v.Author[:]) + string(v.TxPayload) + strconv.FormatInt(v.Timestamp, 10)
+	// Secure Serialization using Binary Write (Avoids string conversion issues)
+	h := sha256.New()
+	h.Write(v.Author[:])
+	h.Write(v.TxPayload)
+	h.Write(v.MerkleRoot[:])
+	binary.Write(h, binary.BigEndian, v.Timestamp)
 	for _, p := range v.Parents {
-		record += p.String()
+		h.Write(p[:])
 	}
-	return sha256.Sum256([]byte(record))
+	var res Hash
+	copy(res[:], h.Sum(nil))
+	return res
 }

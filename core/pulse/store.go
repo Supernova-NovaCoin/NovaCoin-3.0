@@ -186,6 +186,28 @@ func (vs *VertexStore) GetAllVertices() []*Vertex {
 	return all
 }
 
+// HasVertex checks if a vertex exists in the store
+func (vs *VertexStore) HasVertex(hash Hash) bool {
+	vs.mu.RLock()
+	defer vs.mu.RUnlock()
+	_, exists := vs.Vertices[hash]
+	return exists
+}
+
+// GetVertex returns a vertex by hash, or nil if not found
+func (vs *VertexStore) GetVertex(hash Hash) *Vertex {
+	vs.mu.RLock()
+	defer vs.mu.RUnlock()
+	return vs.Vertices[hash]
+}
+
+// VertexCount returns the number of vertices in the store
+func (vs *VertexStore) VertexCount() int {
+	vs.mu.RLock()
+	defer vs.mu.RUnlock()
+	return len(vs.Vertices)
+}
+
 // GetRecentVertices returns the last N blocks added.
 func (vs *VertexStore) GetRecentVertices() []*Vertex {
 	vs.mu.RLock()

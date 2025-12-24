@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/gob"
 	"encoding/hex"
 	"flag"
 	"fmt"
@@ -109,11 +111,14 @@ func sendToNetwork(tx types.Transaction) {
 	}
 	defer conn.Close()
 
-	// Simple payload: "TX:<FROM>:<TO>:<AMT>" for demo ingest parsing
-	// In reality we send binary.
-	payload := fmt.Sprintf("TX:%x:%x:%d", tx.From, tx.To, tx.Amount)
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	if err := enc.Encode(tx); err != nil {
+		fmt.Println("Error encoding tx:", err)
+		return
+	}
 
-	conn.Write([]byte(payload))
-	fmt.Println("✅ Transaction Signed & Broadcasted!")
-	fmt.Printf("Tx Hash: %x\n", payload[:10]+"...") // Mock hash
+	conn.Write(buf.Bytes())
+	fmt.Println("✅ Transaction Signed & Broadcasted (Gob Binary)!")
+	fmt.Printf("Tx Hash: %x\n", tx.Sig)
 }
